@@ -10,6 +10,7 @@
 *   **Hardware Constraint**: AutoDL 单节点 (RTX 4090 )
 *   **Padding Strategy**: 强制 `Left-Padding` 以支持自回归生成
 
+
 ## 3. Directory Structure
 ```text
 minimal-grpo/
