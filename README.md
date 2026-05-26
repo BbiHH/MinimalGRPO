@@ -24,6 +24,7 @@ minimal-grpo/
 ├── main.py                   # 训练主循环入口
 └── README.md
 
+```
 
 ## 4. Algorithmic Implementation Details
 
