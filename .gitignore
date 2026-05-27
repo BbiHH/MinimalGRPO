@@ -1,1 +1,6 @@
 .aider*
+*.pt
+*.pth
+*.jsonl
+*.pyc
+*.safetensors
