@@ -117,13 +117,13 @@ def _single_reward(prompt: str, response: str) -> float:
     # 简单 token 估算（英文按空格切分即可近似）
     word_count = len(response.split())
 
-    if word_count < 5:
+    if word_count < 10:
         length_score = 0.0          # 太短，没生成有效内容
-    elif word_count < 15:
+    elif word_count < 45:
         length_score = 0.15         # 有基本内容但不够详细
-    elif word_count <= 80:
+    elif word_count <= 120:
         length_score = 0.4          # 理想长度范围
-    elif word_count <= 150:
+    elif word_count <= 180:
         length_score = 0.3          # 偏长但可接受
     else:
         length_score = 0.1          # 太长，可能跑题

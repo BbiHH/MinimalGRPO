@@ -18,6 +18,14 @@ import torch
 from typing import List, Dict, Tuple
 
 
+# 引入工具调用的prompt
+
+TOOL_SYSTEM_PROMPT = (
+    "You are a helpful assistant with access to a calculator. "
+    "When you need to perform arithmetic, you MUST use the calculator "
+    "by writing <calc>expression</calc>. Then provide the final answer."
+)
+
 def load_prompts(filepath: str) -> List[str]:
     """
     功能: 从 JSONL 文件中加载 prompt 文本列表
@@ -270,7 +278,8 @@ def extract_response_and_mask(
 def rollout(
     model,
     tokenizer,
-    prompt_file: str,
+    prompt_file: str = None,
+    prompts_list: List[str] = None,
     G: int = 4,
     max_new_tokens: int = 128,
     temperature: float = 0.7,
@@ -301,8 +310,15 @@ def rollout(
             "responses_text"  — List[str], 生成的 response 文本（B*G 个）
             "G"               — int, 组大小
     """
-    # Step 1: 加载 prompts
-    prompts_text = load_prompts(prompt_file)
+    # Step 1: 加载 prompts（文件 或 直接传入的列表）
+    if prompts_list is not None:
+        prompts_text = prompts_list
+        print(f"[rollout] Received {len(prompts_text)} prompts from list")
+    elif prompt_file is not None:
+        prompts_text = load_prompts(prompt_file)
+    else:
+        raise ValueError("Either prompt_file or prompts_list must be provided.")
+    
     B = len(prompts_text)
     
     # Step 2: Tokenize + Left-Padding
