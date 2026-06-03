@@ -92,44 +92,48 @@ def _extract_box_answer(text):
 
 def _tool_reward(response, answer):
     """
-    按照模型的回复进行打分，这里针对的是 计算工具的打分。
+    calculator 任务打分。
 
-    打分规则:
-        - <calc> 标签格式正确: +0.3
-        - <box> 标签格式正确: +0.2
-        - 最终答案与标准答案一致: +1.0
-        - 满分: 1.5
+    分数构成：
+    格式分:  <calc> 正确闭合 +0.3, <box> 正确闭合 +0.2  → 满分 0.5
+    结果分:  answer 正确 +1.0
+    工具分:  answer 正确 且 用了 calc → +0.3
+    满分: 1.8
 
-    :param response: 模型生成的 response 文本
-    :param answer:   标准答案（数值，来自 JSONL）
-    :return: float, 范围 [0.0, 1.5]
+    设计原则：
+    - 用工具计算 → 必须 <calc> 闭合
+    - 给出计算结果 → 必须 <box> 闭合
+    - 格式分只看这两条硬规矩，和答案对错无关
+    - 结果分和工具分才是核心权重
     """
     score = 0.0
 
-    # 1. <calc> 格式分：检查是否至少有一个正确闭合的 <calc>...</calc>
+    # ---- 格式：两条硬规矩 ----
+    # 规矩 1: 用工具计算 → 必须 <calc> 闭合
     calc_exprs = extract_calc_expressions(response)
     if len(calc_exprs) > 0:
         score += 0.3
 
-    # 2. <box> 格式分：检查是否至少有一个正确闭合的 <box>...</box>
+    # 规矩 2: 给出结果 → 必须 <box> 闭合
     box_answers = _extract_box_answer(response)
     if len(box_answers) > 0:
         score += 0.2
 
-    # 3. 结果分：执行 calculator 并和标准答案比较
-    #    取最后一个 <box> 里的值作为模型给出的最终答案
+    # ---- 结果分 ----
+    answer_correct = False
     if len(box_answers) > 0:
-        # 用 calculator 验算 <calc> 表达式，但最终打分以 <box> 里的答案为准
-        final_answer_str = box_answers[-1].strip()
         try:
-            # 尝试数值比较（支持 int/float）
-            model_answer = float(final_answer_str)
-            target_answer = float(answer)
-            if abs(model_answer - target_answer) < 1e-6:
-                score += 1.0
+            if abs(float(box_answers[-1].strip()) - float(answer)) < 1e-6:
+                answer_correct = True
         except (ValueError, TypeError):
-            # 如果 answer 为 None 或 <box> 里的内容不是数值，不给结果分
             pass
+
+    if answer_correct:
+        score += 1.0
+
+    # ---- 工具分 ----
+    if answer_correct and len(calc_exprs) > 0:
+        score += 0.3
 
     return score
 
@@ -185,26 +189,56 @@ def _heuristic_reward(response: str) -> float:
 
     return total
 
+def _degeneracy_penalty(response: str) -> float:
+    """
+    通用退化检测，所有任务类型共用。
+
+    检测三种垃圾输出：
+    - 循环重复：同一短语反复出现
+    - 乱码：不可读的 token 序列
+    - 空回复：没生成任何有效内容
+    """
+    penalty = 0.0
+    text = response.strip()
+    words = text.split()
+    n_words = len(words)
+
+    # 1. 空回复或极短
+    if n_words < 3:
+        return -0.5
+
+    # 2. 循环重复检测（3-gram 唯一比例）
+    if n_words >= 9:
+        trigrams = [tuple(words[i:i+3]) for i in range(n_words - 2)]
+        unique_ratio = len(set(trigrams)) / len(trigrams)
+        if unique_ratio < 0.25:      # < 25% 唯一 → 严重重复
+            penalty -= 0.5
+        elif unique_ratio < 0.4:     # 25-40% → 轻度重复
+            penalty -= 0.2
+
+    # 3. 乱码检测
+    # 平均词长 > 20 → 大概率是随机 token 拼成的
+    avg_word_len = sum(len(w) for w in words) / n_words
+    if avg_word_len > 20:
+        penalty -= 0.5
+
+    # 非字母非空白字符占比 > 70% → 符号乱码
+    non_alpha = sum(1 for c in text if not c.isalpha() and not c.isspace())
+    if len(text) > 10 and non_alpha / len(text) > 0.7:
+        penalty -= 0.3
+
+    return penalty
 
 def _single_reward(prompt: str, response: str, task_type: str = "general", answer=None) -> float:
-    """
-    功能：对单个 (prompt, response) 对计算奖励，按 task_type 分发到具体评分函数
-
-    输入：
-        prompt:    str，原始 prompt 文本
-        response:  str，模型生成的 response 文本
-        task_type: str，任务类型，决定走哪套评分逻辑
-                   "calculator" → _tool_reward(response, answer)
-                   其他          → _heuristic_reward(response)
-        answer:    标准答案（仅 calculator 任务使用）
-
-    输出：
-        score: float，tool-use 满分 1.5，启发式满分 1.0
-    """
     if task_type == "calculator":
-        return _tool_reward(response, answer)
+        score = _tool_reward(response, answer)
     else:
-        return _heuristic_reward(response)
+        score = _heuristic_reward(response)
+
+    # 通用退化惩罚，所有任务类型生效
+    score += _degeneracy_penalty(response)
+
+    return score
 
 
 def _is_gibberish(text: str) -> bool:

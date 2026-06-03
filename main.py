@@ -12,7 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import random
 import swanlab
 import sys
-from typing import List, Dict
+from typing import List
 
 sys.path.insert(0, "src")
 from rollout import rollout, PromptExample, TOOL_SYSTEM_PROMPT, load_prompts
@@ -23,35 +23,35 @@ from tool import extract_calc_expressions
 
 CONFIG = {
     # --- 模型 ---
-    "model_name":         "Qwen/Qwen2.5-0.5B-Instruct",
+    "model_name":         "Qwen/Qwen2.5-1.5B-Instruct",
 
     # --- Rollout ---
     "calculator_prompt_file":  "data/tool_calling_prompts.jsonl",
     "general_prompt_file":     "data/prompts.jsonl",    # None = calculator-only
-    "use_mixed_training":      True,                     # True = 混合 calculator + general
-    "batch_size":              4,
+    "use_mixed_training":      None,                     # True = 混合 calculator + general
+    "batch_size":              2,
     "G":                       8,
-    "max_new_tokens":          300,           # tool-use 输出更长，需更多 token
+    "max_new_tokens":          200,           # tool-use 输出更长，需更多 token
     "temperature":             0.8,
 
     # --- Loss ---
     "eps_clip":           0.2,
-    "beta":               0.04,
+    "beta":               0.03,
     "ppo_epochs":         4,
-    "target_kl":          0.02,
+    "target_kl":          0.04,
 
     # --- 训练步数 ---
     "num_epochs":         10,
-    "steps_per_epoch":    50,
+    "steps_per_epoch":    100,
 
     # --- 优化器 ---
-    "learning_rate":      5e-6,
+    "learning_rate":      1e-6,
     "grad_clip_norm":     1.0,
 
     # --- 日志与保存 ---
     "log_interval":       1,
     "save_dir":           "checkpoints",
-    "save_interval":      100,
+    "save_interval":      500,
 
     # --- 资源与复现 ---
     "dtype":              torch.bfloat16,

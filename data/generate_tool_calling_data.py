@@ -9,7 +9,7 @@ import os
 random.seed(42)
 
 OUTPUT_FILE = "data/tool_calling_prompts.jsonl"
-NUM_SAMPLES = 200
+NUM_SAMPLES = 2000
 
 def generate_sample():
     """生成一个数学问题 + 正确答案"""
@@ -88,7 +88,7 @@ def generate_sample():
             answer = int(answer)
 
     prompt = random.choice(templates)
-    return {"prompt": prompt, "answer": answer}
+    return {"prompt": prompt, "answer": answer, "task_type": "calculator"}
 
 
 # 生成数据

@@ -53,10 +53,10 @@ class PromptExample:
 TOOL_SYSTEM_PROMPT = (
     "You are a helpful assistant with access to a calculator. "
     "When you need to perform arithmetic, you MUST use the calculator "
-    "by writing <calc>expression</calc>. Then provide the final answer. \n"
+    "by writing <calc>expression</calc>. Then provide the final answer."
     "example: \n"
-    "User: Compute the sum: 1545 + 3592."
-    "Assistant: Let me use the calculator <calc>1545 + 3592</calc>, the answer is <box>5179</box>."
+    "user: Compute the sum: 1545 + 3592."
+    "assistant: Let me use the calculator <calc>1545 + 3592</calc>, the answer is <box>5179</box>."
 )
 
 def load_prompts(filepath: str) -> List[PromptExample]:
@@ -178,11 +178,6 @@ def tokenize_prompts(
         return_tensors="pt",          # 返回 PyTorch 张量
     )
 
-    B = len(examples)
-    L_prompt = prompt_dict["input_ids"].shape[1]
-    print(f"[rollout] Tokenized: B={B}, L_prompt={L_prompt}")
-    print(f"[rollout] input_ids shape: {prompt_dict['input_ids'].shape}")
-
     return prompt_dict
 
 
@@ -226,9 +221,6 @@ def expand_for_group(
     expanded_ids = torch.repeat_interleave(prompt_ids, repeats=G, dim=0)
     expanded_mask = torch.repeat_interleave(attention_mask, repeats=G, dim=0)
     
-    B_orig = prompt_ids.shape[0]
-    print(f"[rollout] Expanded: {B_orig} prompts × G={G} = {expanded_ids.shape[0]} samples")
-    print(f"[rollout] expanded_ids shape: {expanded_ids.shape}")
     
     return expanded_ids, expanded_mask
 
@@ -298,7 +290,6 @@ def generate_responses(
     # full_ids shape: [B*G, L_prompt + actual_response_len]
     # 注意：不同样本的 actual_response_len 可能不同！
     # model.generate 会自动 padding 到最长序列
-    print(f"[rollout] Generated: full_ids shape = {full_ids.shape}")
     
     return full_ids
 
@@ -339,9 +330,6 @@ def extract_response_and_mask(
     # 因为 left-padding，所有样本的 prompt 长度相同 (= prompt_len)
     response_ids = full_ids[:, prompt_len:]        # shape [B*G, L_response]
     response_mask = full_mask[:, prompt_len:]       # shape [B*G, L_response]
-    
-    print(f"[rollout] Response shape: {response_ids.shape}")
-    print(f"[rollout] Response mask shape: {response_mask.shape}")
     
     return response_ids, response_mask, full_mask
 
@@ -459,7 +447,6 @@ def rollout(
         response_ids, skip_special_tokens=True
     )
 
-    print(f"[rollout] Complete! Generated {len(responses_text)} responses.")
     # 打印第一个样本的完整 prompt（含 chat template）和 response，方便调试
     sample_prompt = tokenizer.decode(full_ids[0, :L_prompt], skip_special_tokens=False)
     print(f"[rollout] ── Sample[0] full prompt ──\n{sample_prompt}\n── Sample[0] response ──\n{responses_text[0]}\n── end sample ──")
