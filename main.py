@@ -12,6 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import random
 import swanlab
 import sys
+from typing import List, Dict
 
 sys.path.insert(0, "src")
 from rollout import rollout, PromptExample, TOOL_SYSTEM_PROMPT, load_prompts
