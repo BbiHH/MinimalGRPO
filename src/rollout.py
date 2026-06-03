@@ -460,7 +460,9 @@ def rollout(
     )
 
     print(f"[rollout] Complete! Generated {len(responses_text)} responses.")
-    print(f"[rollout] Sample response[0]: {responses_text[0][:100]}...")
+    # 打印第一个样本的完整 prompt（含 chat template）和 response，方便调试
+    sample_prompt = tokenizer.decode(full_ids[0, :L_prompt], skip_special_tokens=False)
+    print(f"[rollout] ── Sample[0] full prompt ──\n{sample_prompt}\n── Sample[0] response ──\n{responses_text[0]}\n── end sample ──")
 
     return {
         "full_ids":         full_ids,          # [B*G, L_total]
