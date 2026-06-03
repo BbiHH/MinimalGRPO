@@ -17,7 +17,30 @@ _SAFE_DICT = {
     "__builtins__": None,
 }
 
+# 计算器表达式解析
+def extract_calc_expressions(text: str) -> list[str]:
+    """
+    从文本中提取所有 <calc>...</calc> 标签内的表达式。
 
+    使用非贪婪匹配，只提取正确闭合的标签内容（必须有 </calc>）。
+    不处理未闭合或嵌套的标签。
+
+    参数：
+        text: 可能包含 <calc> 标签的文本
+
+    返回：
+        表达式字符串列表（不包含标签本身）
+
+    示例：
+        extract_calc_expressions("<calc>3+5</calc> and <calc>2*4</calc>")
+        -> ["3+5", "2*4"]
+    """
+    # 非贪婪匹配成对出现的 <calc>...</calc>
+    pattern = r'<calc>(.*?)</calc>'
+    return re.findall(pattern, text)
+
+
+# 计算器工具
 def calculator(expression: str) -> str:
     """
     安全计算数学表达式，返回字符串结果。
@@ -56,3 +79,45 @@ def calculator(expression: str) -> str:
         return "[Error: syntax error]"
     except Exception as e:
         return f"[Error: {str(e)}]"
+    
+# 计算器工具编排
+def execute_calcs(text: str) -> tuple[str, list[str]]:
+    """
+    执行文本中所有 <calc>expression</calc> 的计算，
+    返回替换后的文本和结果列表。
+
+    对每个 <calc> 标签内的表达式调用 calculator() 计算，
+    然后将 "<calc>expr</calc>" 替换为 "<calc>expr</calc> = result"。
+
+    参数：
+        text: 包含 <calc> 标签的文本
+
+    返回：
+        (modified_text, results) 元组
+        - modified_text: 每个标签被替换为带结果的文本
+        - results: 各表达式计算结果（字符串）
+
+    示例：
+        text = "Let me calculate. <calc>3+5</calc> The answer is 8."
+        execute_calcs(text)
+        -> ("Let me calculate. <calc>3+5</calc> = 8 The answer is
+8.", ["8"])
+    """
+    pattern = r'<calc>(.*?)</calc>'
+
+    # 取出所有表达式并计算
+    expressions = re.findall(pattern, text)
+    results = [calculator(expr) for expr in expressions]
+
+    # 逐个替换，确保每个标签对应正确的计算结果
+    counter = 0
+
+    def replace_match(match: re.Match) -> str:
+        nonlocal counter
+        expr = match.group(1)
+        result = results[counter]
+        counter += 1
+        return f"<calc>{expr}</calc> = {result}"
+
+    modified_text = re.sub(pattern, replace_match, text)
+    return modified_text, results

@@ -25,6 +25,8 @@ src/reward.py — Phase 2: Reward & Advantage 计算模块
 
 import torch
 from typing import Dict, List
+import re
+from tool import extract_calc_expressions, execute_calcs
 
 
 # ============================================================
@@ -35,6 +37,8 @@ def compute_rewards(
     prompts_text: List[str],
     responses_text: List[str],
     G: int,
+    answers: List = None,
+    task_types: List[str] = None,
 ) -> torch.Tensor:
     """
     功能：为每个 (prompt, response) 计算标量奖励分数
@@ -45,22 +49,13 @@ def compute_rewards(
         responses_text: List[str], 长度 = B*G
                         （每个 prompt 有 G 个 response）
         G:              int，组大小
+        answers:        List, 长度 = B*G（含 None）
+                        标准答案，用于 tool-use 任务打分
+        task_types:     List[str], 长度 = B*G（含 None）
+                        任务类型，用于 reward 分发；默认全部为 "general"
 
     输出：
         rewards: Tensor[B*G]，dtype=float32
-
-    实现：
-        当前使用规则奖励（rule-based reward），不引入额外模型。
-        未来可替换为训练好的 reward model。
-
-    奖励规则（针对不同任务可自定义）：
-        规则 1 — 长度奖励：适当长度（30-100 token）得分高
-        规则 2 — 格式奖励：不包含乱码/重复
-        规则 3 — 关键词奖励：包含问题相关的关键词（可选）
-
-    为什么用规则而不直接用"正确性"？
-        因为大多数开放回答没有标准答案。我们先用通用的启发式规则，
-        确保框架跑通。后续针对具体任务再设计精确奖励。
     """
     B = len(prompts_text)
     rewards_list = []
@@ -68,8 +63,10 @@ def compute_rewards(
     for i, response in enumerate(responses_text):
         prompt_idx = i // G  # 这个 response 属于第几个 prompt
         prompt = prompts_text[prompt_idx]
+        answer = answers[i] if answers is not None else None
+        task_type = task_types[i] if task_types is not None else "general"
 
-        score = _single_reward(prompt, response)
+        score = _single_reward(prompt, response, task_type=task_type, answer=answer)
         rewards_list.append(score)
 
     rewards = torch.tensor(rewards_list, dtype=torch.float32)
@@ -84,32 +81,72 @@ def compute_rewards(
     return rewards
 
 
-def _single_reward(prompt: str, response: str) -> float:
+def _extract_box_answer(text):
     """
-    功能：对单个 (prompt, response) 对计算奖励
+    提取response中的答案
+    """
+
+    pattern = r'<box>(.*?)</box>'
+    return re.findall(pattern, text)
+
+
+def _tool_reward(response, answer):
+    """
+    按照模型的回复进行打分，这里针对的是 计算工具的打分。
+
+    打分规则:
+        - <calc> 标签格式正确: +0.3
+        - <box> 标签格式正确: +0.2
+        - 最终答案与标准答案一致: +1.0
+        - 满分: 1.5
+
+    :param response: 模型生成的 response 文本
+    :param answer:   标准答案（数值，来自 JSONL）
+    :return: float, 范围 [0.0, 1.5]
+    """
+    score = 0.0
+
+    # 1. <calc> 格式分：检查是否至少有一个正确闭合的 <calc>...</calc>
+    calc_exprs = extract_calc_expressions(response)
+    if len(calc_exprs) > 0:
+        score += 0.3
+
+    # 2. <box> 格式分：检查是否至少有一个正确闭合的 <box>...</box>
+    box_answers = _extract_box_answer(response)
+    if len(box_answers) > 0:
+        score += 0.2
+
+    # 3. 结果分：执行 calculator 并和标准答案比较
+    #    取最后一个 <box> 里的值作为模型给出的最终答案
+    if len(box_answers) > 0:
+        # 用 calculator 验算 <calc> 表达式，但最终打分以 <box> 里的答案为准
+        final_answer_str = box_answers[-1].strip()
+        try:
+            # 尝试数值比较（支持 int/float）
+            model_answer = float(final_answer_str)
+            target_answer = float(answer)
+            if abs(model_answer - target_answer) < 1e-6:
+                score += 1.0
+        except (ValueError, TypeError):
+            # 如果 answer 为 None 或 <box> 里的内容不是数值，不给结果分
+            pass
+
+    return score
+
+def _heuristic_reward(response: str) -> float:
+    """
+    功能：对单个 response 使用启发式规则计算奖励（不依赖 prompt 或 answer）
 
     输入：
-        prompt:   str，原始 prompt 文本
         response: str，模型生成的 response 文本
 
     输出：
-        score: float，范围通常 [0.0, 1.0]
+        score: float，范围 [0.0, 1.0]
 
-    规则详解：
-        (1) 长度分 (0.0 - 0.5)
-            太短（<10字）：可能没说完 → 低分
-            太短（10-20字）：简单回答但可能不完整 → 中等
-            合适（20-100字）：可能比较详细 → 高分
-            太长（>100字）：可能啰嗦或跑题 → 中等偏低
-            公式：len_score = 0.5 * min(1.0, (len-10) / 90)
-                  确保 10→0, 100→0.5
-
-        (2) 格式分 (0.0 - 0.3)
-            如果 response 只包含空白/特殊字符 → 0
-            如果包含正常可读内容 → 0.3
-
-        (3) 内容分 (0.0 - 0.2)
-            暂时给固定基础分，后续可接入更复杂的评估
+    评分维度：
+        1. 长度分数 — 根据 response 单词数给分
+        2. 格式分数 — 排除空回复和乱码
+        3. 内容基础分 — 固定基础分
     """
     response = response.strip()
 
@@ -147,6 +184,27 @@ def _single_reward(prompt: str, response: str) -> float:
     total = max(0.0, min(1.0, total))
 
     return total
+
+
+def _single_reward(prompt: str, response: str, task_type: str = "general", answer=None) -> float:
+    """
+    功能：对单个 (prompt, response) 对计算奖励，按 task_type 分发到具体评分函数
+
+    输入：
+        prompt:    str，原始 prompt 文本
+        response:  str，模型生成的 response 文本
+        task_type: str，任务类型，决定走哪套评分逻辑
+                   "calculator" → _tool_reward(response, answer)
+                   其他          → _heuristic_reward(response)
+        answer:    标准答案（仅 calculator 任务使用）
+
+    输出：
+        score: float，tool-use 满分 1.5，启发式满分 1.0
+    """
+    if task_type == "calculator":
+        return _tool_reward(response, answer)
+    else:
+        return _heuristic_reward(response)
 
 
 def _is_gibberish(text: str) -> bool:
@@ -270,12 +328,14 @@ def compute_rewards_and_advantages(
     """
     prompts_text   = rollout_batch["prompts_text"]     # List[str], len=B
     responses_text = rollout_batch["responses_text"]   # List[str], len=B*G
+    answers        = rollout_batch.get("answers", None) # List, len=B*G (向后兼容旧 batch)
+    task_types     = rollout_batch.get("task_types", None)  # List[str], len=B*G (向后兼容旧 batch)
     G = rollout_batch["G"]
 
     print(f"[reward] Computing rewards for {len(responses_text)} responses...")
 
     # Step 1: 计算原始奖励
-    rewards = compute_rewards(prompts_text, responses_text, G)
+    rewards = compute_rewards(prompts_text, responses_text, G, answers, task_types)
 
     # Step 2: 组内标准化 → Advantage
     advantages = compute_advantages(rewards, G)

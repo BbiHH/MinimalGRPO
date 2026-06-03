@@ -26,9 +26,14 @@ def compute_log_probs(
     full_ids: torch.Tensor,
     full_mask: torch.Tensor,
     prompt_len: int,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    功能：对模型做一次前向传播，提取 response 部分每个 token 的 log-prob
+    功能：对模型做一次前向传播，提取 response 部分每个 token 的 log-prob 和 entropy
+
+    Returns:
+        response_logp:    [N, L_response] — 每个 response token 在策略下的 log-prob
+        response_entropy: [N, L_response] — 每个 response token 的策略熵 H = -sum(p * log p)
+                          高熵 = 模型对该位置不确定（仍在探索），低熵 = 模型趋于确定（可能收敛）
     """
     # --- Step 1: 前向传播 ---
     device = next(model.parameters()).device
@@ -47,7 +52,7 @@ def compute_log_probs(
     shift_logits = logits[:, :-1, :]             # [N, L_total-1, V]
     shift_targets = full_ids[:, 1:]              # [N, L_total-1]
 
-    # --- Step 3: log_softmax + gather ---
+    # --- Step 3: log_softmax + gather + entropy ---
     log_probs = F.log_softmax(shift_logits, dim=-1)  # [N, L_total-1, V]
 
     # 取出实际 token 对应的 log-prob
@@ -56,10 +61,16 @@ def compute_log_probs(
         index=shift_targets.unsqueeze(-1)
     ).squeeze(-1)                                # [N, L_total-1]
 
-    # --- Step 4: 截取 response 部分 ---
-    response_logp = per_token_logp[:, prompt_len - 1:]  # [N, L_response]
+    # 计算 per-token 策略熵：H = -sum(p * log(p))
+    # 高熵 = 策略不确定（有益于探索），低熵 = 策略过于确定（可能模式坍塌）
+    probs = torch.exp(log_probs)                           # [N, L_total-1, V]
+    per_token_entropy = -(probs * log_probs).sum(dim=-1)   # [N, L_total-1]
 
-    return response_logp
+    # --- Step 4: 截取 response 部分 ---
+    response_logp = per_token_logp[:, prompt_len - 1:]           # [N, L_response]
+    response_entropy = per_token_entropy[:, prompt_len - 1:]     # [N, L_response]
+
+    return response_logp, response_entropy
 
 
 # ============================================================
@@ -78,7 +89,7 @@ def compute_ref_log_probs(
     full_mask = batch["full_mask"]
     prompt_len = batch["prompt_len"]
     
-    logp_ref = compute_log_probs(ref_model, full_ids, full_mask, prompt_len)
+    logp_ref, _ = compute_log_probs(ref_model, full_ids, full_mask, prompt_len)
     
     # 彻底切断与计算图的联系，只保留纯张量数据
     return logp_ref.detach()
@@ -176,12 +187,25 @@ def compute_loss(
     logp_ref = batch["logp_ref"]
 
     # Step 1: 仅对当前策略 Actor 做动态前向传播
-    logp_actor = compute_log_probs(model, full_ids, full_mask, prompt_len)
+    logp_actor, response_entropy = compute_log_probs(model, full_ids, full_mask, prompt_len)
 
     # Step 2: 计算比率和 KL 散度
     ratio, kl_per_token, log_ratio = compute_ratio_and_kl(
         logp_actor, logp_ref, response_mask
     )
+
+    # --- 提取策略质量监控指标（仅有效 token）---
+    # 这些指标帮助判断 GRPO 训练是否健康：
+    #   - ratio_mean ~1.0: 策略更新幅度合理
+    #   - ratio_max < 5.0: 无极端重要性采样权重，梯度稳定
+    #   - entropy_mean > 0.5: 策略仍有探索空间，未模式坍塌
+    mask_bool = response_mask.bool()
+    valid_ratio = ratio[mask_bool]
+    ratio_mean = valid_ratio.mean().item()
+    ratio_max = valid_ratio.max().item()
+
+    valid_entropy = response_entropy[mask_bool]
+    entropy_mean = valid_entropy.mean().item()
 
     # Step 3: 计算无偏置 GRPO 损失
     loss = compute_grpo_loss(
@@ -190,9 +214,13 @@ def compute_loss(
     )
 
     # 写入 batch
-    batch["loss"]         = loss
-    batch["logp_actor"]   = logp_actor
-    batch["kl_per_token"] = kl_per_token
-    batch["ratio"]        = ratio
+    batch["loss"]              = loss
+    batch["logp_actor"]        = logp_actor
+    batch["kl_per_token"]      = kl_per_token
+    batch["ratio"]             = ratio
+    batch["entropy_mean"]      = entropy_mean        # scalar float — 策略熵均值
+    batch["ratio_mean"]        = ratio_mean           # scalar float — 重要性比率均值
+    batch["ratio_max"]         = ratio_max            # scalar float — 重要性比率最大值
+    batch["response_entropy"]  = response_entropy     # [N, L_response] tensor — 保留用于深层分析
 
     return batch

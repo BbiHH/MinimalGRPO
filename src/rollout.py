@@ -15,7 +15,37 @@ Docstring for projects.MinimalGRPO.src.rollout
 
 import json
 import torch
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Any
+from dataclasses import dataclass, field
+
+
+# ============================================================
+# 数据抽象层：PromptExample — 训练数据的基本单元
+# ============================================================
+# 设计理念：
+#   原来的代码用三个并行列表 (prompts, answers, task_types) 承载数据，
+#   这种"列式存储"(columnar) 在添加新字段时需要修改所有函数签名和调用处。
+#   改为"行式存储"(row-oriented) 后，每一行数据是一个自包含的 PromptExample，
+#   添加新字段只需修改 dataclass 定义，调用方无需改动 —— 随数据流自然透传。
+#
+#   另一个关键设计：system_prompt 从 batch 级参数下沉为 per-example 字段。
+#   这让混合训练成为可能：calculator 示例注入工具使用说明，general 示例不注入。
+@dataclass
+class PromptExample:
+    """训练数据的基本单元，自包含所有字段，随数据流透传
+
+    Attributes:
+        text:           prompt 文本，必填字段
+        answer:         标准答案（tool-use 任务）, None 表示无答案的任务
+        task_type:      任务类型，决定 reward 分发逻辑 ("calculator" → 工具评分, "general" → 启发式评分)
+        system_prompt:  per-example 的 system prompt，None 表示不注入 system message
+                        这是混合训练的关键：calculator 示例注入 TOOL_SYSTEM_PROMPT，
+                        general 示例不注入，让模型在同一个 batch 中学到不同的交互模式
+    """
+    text: str
+    answer: Any = None
+    task_type: str = "general"
+    system_prompt: str | None = None
 
 
 # 引入工具调用的prompt
@@ -23,72 +53,113 @@ from typing import List, Dict, Tuple
 TOOL_SYSTEM_PROMPT = (
     "You are a helpful assistant with access to a calculator. "
     "When you need to perform arithmetic, you MUST use the calculator "
-    "by writing <calc>expression</calc>. Then provide the final answer."
+    "by writing <calc>expression</calc>. Then provide the final answer. \n"
+    "example: \n"
+    "User: Compute the sum: 1545 + 3592."
+    "Assistant: Let me use the calculator <calc>1545 + 3592</calc>, the answer is <box>5179</box>."
 )
 
-def load_prompts(filepath: str) -> List[str]:
+def load_prompts(filepath: str) -> List[PromptExample]:
     """
-    功能: 从 JSONL 文件中加载 prompt 文本列表
-    
+    功能: 从 JSONL 文件中加载 prompt 数据，返回 PromptExample 列表
+
     输入:
-        filepath: str  —  e.g. "data/prompts.jsonl"
-    
+        filepath: str  —  e.g. "data/tool_calling_prompts.jsonl"
+
     输出:
-        prompts: List[str]  —  e.g. ["What is ...?", "Explain ...", ...]
-                             长度 = B (batch size)
-    
+        examples: List[PromptExample]  —  每条记录一个 PromptExample，
+                  调用方可按需设置 system_prompt 等字段（如注入 TOOL_SYSTEM_PROMPT）
+
+    JSONL 字段约定:
+        "prompt"     (必填) — prompt 文本
+        "answer"     (可选) — 标准答案，默认 None
+        "task_type"  (可选) — 任务类型，默认 "general"
+
     实现:
-        逐行读取 JSONL，每行提取 "prompt" 字段。
+        逐行读取 JSONL，每行构造一个 PromptExample。
+        注意：system_prompt 不在此处设置 —— 由上层调用方（如 load_training_data）
+        根据数据集类型注入，保持了"数据加载"和"训练配置"的职责分离。
     """
-    prompts = []
+    examples: List[PromptExample] = []
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:       # 跳过空行
                 continue
             data = json.loads(line)
-            prompts.append(data["prompt"])
-    print(f"[rollout] Loaded {len(prompts)} prompts from {filepath}")
-    return prompts
+            example = PromptExample(
+                text=data["prompt"],
+                answer=data.get("answer", None),
+                task_type=data.get("task_type", "general"),
+                # system_prompt 保持 None，由上层调用方按需注入
+            )
+            examples.append(example)
+
+    # 统计日志
+    num_with_answers = sum(1 for ex in examples if ex.answer is not None)
+    type_counts: Dict[str, int] = {}
+    for ex in examples:
+        type_counts[ex.task_type] = type_counts.get(ex.task_type, 0) + 1
+
+    print(f"[rollout] Loaded {len(examples)} prompts from {filepath}")
+    print(f"[rollout]   with answers (tool-use tasks): {num_with_answers}")
+    print(f"[rollout]   task type distribution: {type_counts}")
+    return examples
 
 
 def tokenize_prompts(
     tokenizer,
-    prompts: List[str],
+    examples: List[PromptExample],
 ) -> Dict[str, torch.Tensor]:
     """
-    功能: 将文本 prompts 转为 token ids，并做 Left-Padding
-    
+    功能: 将 PromptExample 列表转为 token ids，并做 Left-Padding
+
     为什么必须 Left-Padding?
         - 自回归模型从左到右逐 token 生成
         - 如果右侧有 padding token，模型生成时会产生混乱
         - Left-Padding 确保所有 padding 在序列左侧，生成从右侧开始
-    
+
+    关键设计变更（vs 旧版）:
+        system_prompt 不再作为 batch 级参数传入，而是从每个 PromptExample
+        的 .system_prompt 字段读取。这使得同一个 batch 内可以混合不同的
+        system_prompt 配置 —— 例如 calculator 示例带工具说明，general 示例不带。
+
     输入:
         tokenizer: HuggingFace tokenizer 实例
-        prompts: List[str], 长度 = B
-    
+        examples:  List[PromptExample], 长度 = B
+
     输出:
         prompt_dict: Dict 包含:
             "input_ids"      — shape [B, L_prompt]     (Left-Padded)
             "attention_mask" — shape [B, L_prompt]     (1=有效token, 0=padding)
         其中 L_prompt = max(prompt_len_in_this_batch)
-    
+
     实现细节:
         1. 设置 tokenizer.padding_side = "left"
-        2. 用 apply_chat_template 构建 chat 格式输入
-        3. tokenizer(..., padding=True, return_tensors="pt") 自动 padding
+        2. 按 example.system_prompt 构建 chat 格式消息
+        3. 用 apply_chat_template 生成格式化文本
+        4. tokenizer(..., padding=True, return_tensors="pt") 自动 padding
     """
     # --- 步骤 1: 配置 left-padding ---
     tokenizer.padding_side = "left"      # 强制左侧填充
-    
-    # --- 步骤 2: 每个 prompt 包装成 chat 格式 ---
-    # Qwen2.5-Instruct 是 chat 模型，需要 chat template
-    messages_list = [
-        [{"role": "user", "content": p}]
-        for p in prompts
-    ]
-    
+
+    # --- 步骤 2: 每个 example 按自身 system_prompt 包装成 chat 格式 ---
+    # 关键设计：system_prompt 是 per-example 的，支持混合训练
+    # - calculator 示例: system_prompt=TOOL_SYSTEM_PROMPT → 生成 [system, user] 消息
+    # - general 示例:    system_prompt=None              → 生成 [user] 消息
+    messages_list = []
+    for ex in examples:
+        if ex.system_prompt is not None:
+            messages = [
+                {"role": "system", "content": ex.system_prompt},
+                {"role": "user", "content": ex.text},
+            ]
+        else:
+            messages = [
+                {"role": "user", "content": ex.text},
+            ]
+        messages_list.append(messages)
+
     # apply_chat_template 会生成类似:
     #   "<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n"
     # 这样的格式化字符串
@@ -96,7 +167,7 @@ def tokenize_prompts(
         tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         for messages in messages_list
     ]
-    
+
     # --- 步骤 3: Tokenize + Padding ---
     # padding=True 会自动把不同长度的序列 padding 到 batch 内最长序列的长度
     tokenizer.padding_side = "left"  # 再次确保
@@ -106,12 +177,12 @@ def tokenize_prompts(
         truncation=False,             # 不截断，prompt 一般不太长
         return_tensors="pt",          # 返回 PyTorch 张量
     )
-    
-    B = len(prompts)
+
+    B = len(examples)
     L_prompt = prompt_dict["input_ids"].shape[1]
     print(f"[rollout] Tokenized: B={B}, L_prompt={L_prompt}")
     print(f"[rollout] input_ids shape: {prompt_dict['input_ids'].shape}")
-    
+
     return prompt_dict
 
 
@@ -278,26 +349,40 @@ def extract_response_and_mask(
 def rollout(
     model,
     tokenizer,
+    examples: List[PromptExample] = None,
     prompt_file: str = None,
-    prompts_list: List[str] = None,
     G: int = 4,
     max_new_tokens: int = 128,
     temperature: float = 0.7,
 ) -> Dict[str, torch.Tensor]:
     """
     功能: Rollout 主函数，串联上述所有步骤
-    
+
     这是外部调用的唯一入口。一次调用完成：
       加载 → Tokenize → 扩展 → 生成 → 整理输出
-    
+
+    数据流说明:
+      PromptExample 是贯穿整个 pipeline 的数据载体:
+        prompt_file → load_prompts() → List[PromptExample]
+                                              ↓
+                              rollout() 内部解构成并行列表
+                              (text/answer/task_type) 用于后续处理
+                                              ↓
+                              tokenize_prompts(examples) 按 per-example
+                              system_prompt 构建 chat 消息
+                                              ↓
+                              返回 batch_dict（格式不变，兼容 reward.py/loss.py）
+
     参数:
         model:          HuggingFace CausalLM
         tokenizer:      HuggingFace tokenizer（已设 pad_token）
-        prompt_file:    str, e.g. "data/prompts.jsonl"
+        examples:       List[PromptExample], 直接传入数据（推荐路径，来自 main.py）
+        prompt_file:    str, e.g. "data/tool_calling_prompts.jsonl"（便捷路径，
+                        内部自动调用 load_prompts）
         G:              int, 组大小 (每个 prompt 生成 G 个 response)
         max_new_tokens: int, 最大生成 token 数
         temperature:    float, 采样温度
-    
+
     返回值:
         batch: Dict 包含以下 key:
             "full_ids"        — [B*G, L_total]      完整序列
@@ -308,30 +393,53 @@ def rollout(
             "prompt_len"      — int, prompt 统一长度
             "prompts_text"    — List[str], 原始 prompt 文本（B 个，非 B*G）
             "responses_text"  — List[str], 生成的 response 文本（B*G 个）
+            "answers"         — List, 标准答案（B*G 个，含 None），用于 tool-use reward
+            "task_types"      — List[str], 任务类型（B*G 个），用于 reward dispatch
             "G"               — int, 组大小
     """
-    # Step 1: 加载 prompts（文件 或 直接传入的列表）
-    if prompts_list is not None:
-        prompts_text = prompts_list
-        print(f"[rollout] Received {len(prompts_text)} prompts from list")
-    elif prompt_file is not None:
-        prompts_text = load_prompts(prompt_file)
+    # Step 1: 获取 PromptExample 列表（两种路径）
+    if prompt_file is not None:
+        # 便捷路径：从文件加载（向后兼容，适合快速测试）
+        examples = load_prompts(prompt_file)
+    elif examples is not None:
+        # 标准路径：调用方直接传入已配置好的 examples（如 load_training_data）
+        pass
     else:
-        raise ValueError("Either prompt_file or prompts_list must be provided.")
-    
-    B = len(prompts_text)
-    
-    # Step 2: Tokenize + Left-Padding
-    prompt_dict = tokenize_prompts(tokenizer, prompts_text)
+        raise ValueError("Either prompt_file or examples must be provided.")
+
+    # Step 1.5: 从 PromptExample 列表中解构出并行列表（内部使用）
+    # 为什么在内部解构成并行列表而不是修改下游函数签名？
+    #   - reward.py / loss.py 的接口已稳定，不需要改动
+    #   - 并行列表在 expand_for_group 和 compute_advantages 中更自然
+    #   - PromptExample 的价值在"数据加载和透传"阶段，而非"张量计算"阶段
+    prompts_text = [ex.text for ex in examples]
+    answers = [ex.answer for ex in examples]
+    task_types = [ex.task_type for ex in examples]
+
+    B = len(examples)
+
+    # Step 2: 扩展 answers 和 task_types B → B*G（与 prompt 扩展对齐）
+    answers_expanded = []
+    for a in answers:
+        for _ in range(G):
+            answers_expanded.append(a)
+
+    task_types_expanded = []
+    for t in task_types:
+        for _ in range(G):
+            task_types_expanded.append(t)
+
+    # Step 3: Tokenize + Left-Padding（per-example system_prompt 在此生效）
+    prompt_dict = tokenize_prompts(tokenizer, examples)
     prompt_ids = prompt_dict["input_ids"]        # [B, L_prompt]
     prompt_mask = prompt_dict["attention_mask"]   # [B, L_prompt]
     L_prompt = prompt_ids.shape[1]
-    
-    # Step 3: 扩展 B → B*G
+
+    # Step 4: 扩展 B → B*G
     expanded_ids, expanded_mask = expand_for_group(prompt_ids, prompt_mask, G)
     # expanded_ids: [B*G, L_prompt]
-    
-    # Step 4: 生成 response
+
+    # Step 5: 生成 response
     full_ids = generate_responses(
         model, tokenizer,
         expanded_ids, expanded_mask,
@@ -339,21 +447,21 @@ def rollout(
         temperature=temperature,
     )
     # full_ids: [B*G, L_total]
-    
-    # Step 5: 提取 response 和 mask
+
+    # Step 6: 提取 response 和 mask
     pad_token_id = tokenizer.pad_token_id
     response_ids, response_mask, full_mask = extract_response_and_mask(
         full_ids, L_prompt, pad_token_id
     )
-    
-    # Step 6: 解码文本（用于 reward 计算）
+
+    # Step 7: 解码文本（用于 reward 计算）
     responses_text = tokenizer.batch_decode(
         response_ids, skip_special_tokens=True
     )
-    
+
     print(f"[rollout] Complete! Generated {len(responses_text)} responses.")
     print(f"[rollout] Sample response[0]: {responses_text[0][:100]}...")
-    
+
     return {
         "full_ids":         full_ids,          # [B*G, L_total]
         "full_mask":        full_mask,         # [B*G, L_total]
@@ -363,5 +471,7 @@ def rollout(
         "prompt_len":       L_prompt,
         "prompts_text":     prompts_text,       # List[str], len=B
         "responses_text":   responses_text,     # List[str], len=B*G
+        "answers":          answers_expanded,      # List, len=B*G (含 None)
+        "task_types":       task_types_expanded,    # List[str], len=B*G
         "G":                G,
     }

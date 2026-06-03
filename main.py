@@ -6,19 +6,18 @@ main.py — GRPO 完整训练流程 (性能优化版)
 """
 
 import os
-import json
 import torch
 from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from datetime import datetime
 import random
 import swanlab
 import sys
 
 sys.path.insert(0, "src")
-from rollout import rollout
-from reward import compute_rewards_and_advantages
+from rollout import rollout, PromptExample, TOOL_SYSTEM_PROMPT, load_prompts
+from reward import compute_rewards_and_advantages, _extract_box_answer
 from loss import compute_loss, compute_ref_log_probs
+from tool import extract_calc_expressions
 
 
 CONFIG = {
@@ -26,34 +25,82 @@ CONFIG = {
     "model_name":         "Qwen/Qwen2.5-0.5B-Instruct",
 
     # --- Rollout ---
-    "prompt_file":        "data/prompts.jsonl",
-    "batch_size":         4,              
-    "G":                  8,              
-    "max_new_tokens":     300,            
-    "temperature":        0.8,            
+    "calculator_prompt_file":  "data/tool_calling_prompts.jsonl",
+    "general_prompt_file":     "data/prompts.jsonl",    # None = calculator-only
+    "use_mixed_training":      True,                     # True = 混合 calculator + general
+    "batch_size":              4,
+    "G":                       8,
+    "max_new_tokens":          300,           # tool-use 输出更长，需更多 token
+    "temperature":             0.8,
 
     # --- Loss ---
-    "eps_clip":           0.2,            
-    "beta":               0.04,           
-    "ppo_epochs":         4,              
-    "target_kl":          0.02,           
+    "eps_clip":           0.2,
+    "beta":               0.04,
+    "ppo_epochs":         4,
+    "target_kl":          0.02,
 
     # --- 训练步数 ---
-    "num_epochs":         10,             
-    "steps_per_epoch":    50,             
+    "num_epochs":         10,
+    "steps_per_epoch":    50,
 
     # --- 优化器 ---
     "learning_rate":      5e-6,
-    "grad_clip_norm":     1.0,           
+    "grad_clip_norm":     1.0,
 
     # --- 日志与保存 ---
-    "log_interval":       1,              
+    "log_interval":       1,
     "save_dir":           "checkpoints",
-    "save_interval":      100,            
+    "save_interval":      100,
 
-    # --- 资源 ---
+    # --- 资源与复现 ---
     "dtype":              torch.bfloat16,
+    "seed":               42,
 }
+
+
+def load_training_data(calculator_file: str, general_file: str = None) -> List[PromptExample]:
+    """
+    加载并合并多个 prompt 数据集，构建统一训练池。
+
+    Design decisions（设计决策）:
+      - Calculator 示例注入 TOOL_SYSTEM_PROMPT（per-example），教模型使用工具
+      - General 示例的 system_prompt 保持 None（无工具说明），保持通用对话能力
+      - 混合比例 = 各数据集大小比例（自然平衡），不做手动加权
+      - 返回扁平池供 random.sample() 每步随机采样
+
+    职责边界：
+      load_prompts() 负责文件 I/O → 返回"裸" PromptExample
+      load_training_data() 负责训练配置 → 按数据集来源注入 system_prompt
+      两者分工明确：一个读数据，一个配训练
+    """
+    pool: List[PromptExample] = []
+
+    # 加载 calculator 示例（带工具 system prompt）
+    calc_examples = load_prompts(calculator_file)
+    for ex in calc_examples:
+        ex.system_prompt = TOOL_SYSTEM_PROMPT   # 教模型何时使用 <calc> 标签
+    pool.extend(calc_examples)
+    print(f"[main] Loaded {len(calc_examples)} calculator examples "
+          f"(system_prompt=TOOL_SYSTEM_PROMPT)")
+
+    # 可选加载 general 示例（无 system prompt）
+    if general_file is not None:
+        gen_examples = load_prompts(general_file)
+        # system_prompt 保持 None —— 通用问答不需要工具说明
+        pool.extend(gen_examples)
+        print(f"[main] Loaded {len(gen_examples)} general examples "
+              f"(system_prompt=None)")
+
+    # 打印训练池组成
+    type_counts: Dict[str, int] = {}
+    for ex in pool:
+        type_counts[ex.task_type] = type_counts.get(ex.task_type, 0) + 1
+    has_sys = sum(1 for ex in pool if ex.system_prompt is not None)
+    print(f"[main] Training pool: {len(pool)} total, "
+          f"composition={type_counts}, "
+          f"with_system_prompt={has_sys}/{len(pool)}")
+
+    return pool
 
 
 def setup_model_and_tokenizer(config):
@@ -127,16 +174,24 @@ def main():
     config = CONFIG
     swanlab.init(project="MinimalGRPO", experiment_name="raw_2", config=config, mode="cloud")
 
-    # 一次性加载所有 prompt
-    all_prompts = []
-    with open(config["prompt_file"], "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                all_prompts.append(json.loads(line)["prompt"])
-    
+    # --- 复现性：固定随机种子 ---
+    random.seed(config["seed"])
+    torch.manual_seed(config["seed"])
+
+    # --- 构建训练池：混合 calculator + general ---
+    # load_training_data 负责：
+    #   1. 从 JSONL 加载原始数据（调用 load_prompts）
+    #   2. 按数据集来源注入 per-example system_prompt
+    #   3. 合并为扁平池供随机采样
+    general_file = config["general_prompt_file"] if config["use_mixed_training"] else None
+    training_pool = load_training_data(
+        config["calculator_prompt_file"],
+        general_file=general_file,
+    )
+
     total_rollouts = config["num_epochs"] * config["steps_per_epoch"]
-    print(f"[main] Loaded {len(all_prompts)} prompts. Total rollouts: {total_rollouts}")
+    print(f"[main] Training pool size: {len(training_pool)}. "
+          f"Total rollouts: {total_rollouts}")
 
     model, ref_model, tokenizer = setup_model_and_tokenizer(config)
     optimizer, scheduler = setup_optimizer(model, config, total_rollouts)
@@ -156,21 +211,22 @@ def main():
             # ============================================
             # Phase 1: Rollout — 采样生成回复
             # ============================================
-            batch_prompts = random.sample(
-                all_prompts, min(config["batch_size"], len(all_prompts)))
-            batch = rollout(model=model, tokenizer=tokenizer, prompts_list=batch_prompts,
+            # 每步从训练池随机采样 batch，以 PromptExample 列表传入
+            batch_examples = random.sample(
+                training_pool, min(config["batch_size"], len(training_pool)))
+            batch = rollout(model=model, tokenizer=tokenizer, examples=batch_examples,
                             G=config["G"], max_new_tokens=config["max_new_tokens"],
                             temperature=config["temperature"])
 
             # ============================================
-            # Phase 2: Reward & Advantage 
+            # Phase 2: Reward & Advantage
             # ============================================
             batch = compute_rewards_and_advantages(batch)
-            rewards = batch["rewards"]          
-            advantages = batch["advantages"]    
+            rewards = batch["rewards"]
+            advantages = batch["advantages"]
             reward_history.append(rewards.mean().item())
 
-            # 收集奖励与长度指标
+            # 收集基础指标
             metrics = {}
             metrics["reward/mean"]      = rewards.mean().item()
             metrics["reward/std"]       = rewards.std().item()
@@ -181,6 +237,86 @@ def main():
             metrics["generation/response_length_mean"] = sum(lengths) / len(lengths)
             metrics["generation/response_length_max"]  = max(lengths)
             metrics["generation/response_length_min"]  = min(lengths)
+
+            # --- 组内奖励离散度：同一 prompt 的 G 个 response 之间 reward 的标准差 ---
+            # 高 = 组内区分度大，GRPO 的 advantage 信号强
+            # 低（< 0.1）= response 缺乏多样性，advantage 接近 0，GRPO 训练信号弱
+            B = len(batch["prompts_text"])
+            rewards_2d = rewards.view(B, config["G"])                 # [B, G]
+            within_group_std = rewards_2d.std(dim=-1).mean().item()   # scalar
+            metrics["generation/within_group_reward_std"] = within_group_std
+
+            # ============================================
+            # Phase 2.5: Tool-Use 监控指标
+            # ============================================
+            # 只在 batch 中包含 calculator 示例时才有意义
+            calc_mask = [t == "calculator" for t in batch["task_types"]]
+            if any(calc_mask):
+                responses_text = batch["responses_text"]   # len = B*G
+                answers_list = batch["answers"]            # len = B*G
+
+                # 筛选 calculator 任务的 response 和 answer
+                calc_responses = [responses_text[i] for i, m in enumerate(calc_mask) if m]
+                calc_answers   = [answers_list[i] for i, m in enumerate(calc_mask) if m]
+
+                # tool/use_rate: 至少包含一个 <calc> 标签的 response 比例
+                has_calc_flags = [1 if len(extract_calc_expressions(r)) > 0 else 0
+                                  for r in calc_responses]
+                metrics["tool/use_rate"] = (sum(has_calc_flags) / len(has_calc_flags)
+                                            if has_calc_flags else 0.0)
+
+                # tool/answer_accuracy: <box> 答案与 ground truth 匹配的比例
+                correct = 0
+                for resp, ans in zip(calc_responses, calc_answers):
+                    box_vals = _extract_box_answer(resp)
+                    if box_vals and ans is not None:
+                        try:
+                            if abs(float(box_vals[-1].strip()) - float(ans)) < 1e-6:
+                                correct += 1
+                        except (ValueError, TypeError):
+                            pass
+                metrics["tool/answer_accuracy"] = (correct / len(calc_responses)
+                                                    if calc_responses else 0.0)
+
+                # tool/format_score_mean: calc+box 格式分的平均值
+                format_scores = []
+                for resp in calc_responses:
+                    fs = 0.0
+                    if len(extract_calc_expressions(resp)) > 0:
+                        fs += 0.3
+                    if len(_extract_box_answer(resp)) > 0:
+                        fs += 0.2
+                    format_scores.append(fs)
+                metrics["tool/format_score_mean"] = (sum(format_scores) / len(format_scores)
+                                                      if format_scores else 0.0)
+
+                # reward/tool_mean: calculator 任务的平均奖励
+                calc_rewards = [rewards[i].item() for i, m in enumerate(calc_mask) if m]
+                metrics["reward/tool_mean"] = (sum(calc_rewards) / len(calc_rewards)
+                                                if calc_rewards else 0.0)
+
+                # reward/general_mean: general 任务的平均奖励
+                gen_rewards = [rewards[i].item() for i, m in enumerate(calc_mask) if not m]
+                metrics["reward/general_mean"] = (sum(gen_rewards) / len(gen_rewards)
+                                                   if gen_rewards else 0.0)
+
+            # --- 组内回复多样性：同一 prompt 的 G 个回复中，两两不同的比例 ---
+            # 1.0 = 完全多样（GRPO 组内比较有意义）
+            # < 0.3 = 回复趋于同质化，advantage 退化为噪声，需要增大 temperature 或调整 reward
+            responses_text = batch["responses_text"]  # len = B*G
+            G = config["G"]
+            total_pairs = 0
+            distinct_pairs = 0
+            for b_idx in range(len(batch["prompts_text"])):
+                group_responses = responses_text[b_idx * G : (b_idx + 1) * G]
+                for i in range(G):
+                    for j in range(i + 1, G):
+                        total_pairs += 1
+                        if group_responses[i].strip() != group_responses[j].strip():
+                            distinct_pairs += 1
+            metrics["generation/response_distinct_2"] = (
+                distinct_pairs / total_pairs if total_pairs > 0 else 0.0
+            )
 
             # ============================================
             # Phase 3: Pre-compute Reference Log-Probs
@@ -193,7 +329,7 @@ def main():
             # ============================================
             for ppo_step in range(config["ppo_epochs"]):
                 optimizer.zero_grad()
-                
+
                 # compute_loss 不再需要 ref_model，极大提升内层循环速度
                 batch = compute_loss(model=model, batch=batch,
                                      eps_clip=config["eps_clip"], beta=config["beta"])
@@ -220,6 +356,14 @@ def main():
                 metrics["kl/mean"]               = valid_kl.item()
                 metrics["policy/clip_fraction"]  = clip_fraction
 
+                # 策略级监控指标（由 loss.py 写入 batch dict，已为 scalar float）
+                if "entropy_mean" in batch:
+                    metrics["policy/entropy_mean"] = batch["entropy_mean"]
+                if "ratio_mean" in batch:
+                    metrics["policy/ratio_mean"] = batch["ratio_mean"]
+                if "ratio_max" in batch:
+                    metrics["policy/ratio_max"] = batch["ratio_max"]
+
                 # 反向传播与梯度裁剪
                 loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip_norm"])
@@ -243,10 +387,14 @@ def main():
 
             if global_step % config["log_interval"] == 0:
                 log_metrics(global_step, {
-                    "lr":         metrics.get("train/lr", 0),
-                    "loss":       metrics.get("loss/total", 0),
-                    "reward_mean": metrics.get("reward/mean", 0),
-                    "mean_kl":    metrics.get("kl/mean", 0),
+                    "lr":              metrics.get("train/lr", 0),
+                    "loss":            metrics.get("loss/total", 0),
+                    "reward_mean":     metrics.get("reward/mean", 0),
+                    "mean_kl":         metrics.get("kl/mean", 0),
+                    "entropy_mean":    metrics.get("policy/entropy_mean", 0),
+                    "tool_use_rate":   metrics.get("tool/use_rate", 0),
+                    "tool_answer_acc": metrics.get("tool/answer_accuracy", 0),
+                    "within_group_std": metrics.get("generation/within_group_reward_std", 0),
                 })
 
             if global_step % config["save_interval"] == 0:
